@@ -705,13 +705,54 @@ impl LiveSnapshot {
     }
 }
 
+/// Returns true if the settings only contain an `env` key (or are empty).
+/// Used to detect "official" providers that only manage auth env vars.
+fn is_env_only_claude_settings(settings: &Value) -> bool {
+    settings.as_object().map_or(true, |obj| {
+        obj.is_empty() || (obj.len() == 1 && obj.contains_key("env"))
+    })
+}
+
+/// Merge the provider's `env` value into the existing live settings file, leaving
+/// all other keys (permissions, mcpServers, etc.) untouched.  Falls back to the
+/// provider settings as-is when the live file cannot be read.
+fn merge_env_into_live_settings(path: &std::path::Path, provider_settings: &Value) -> Value {
+    match read_json_file::<Value>(path) {
+        Ok(mut existing) => {
+            if let Some(obj) = existing.as_object_mut() {
+                match provider_settings.get("env") {
+                    Some(env) => {
+                        obj.insert("env".to_string(), env.clone());
+                    }
+                    None => {
+                        obj.remove("env");
+                    }
+                }
+            }
+            existing
+        }
+        Err(_) => provider_settings.clone(),
+    }
+}
+
 /// Write live configuration snapshot for a provider
 pub(crate) fn write_live_snapshot(app_type: &AppType, provider: &Provider) -> Result<(), AppError> {
     match app_type {
         AppType::Claude => {
             let path = get_claude_settings_path();
             let settings = sanitize_claude_settings_for_live(&provider.settings_config);
-            write_json_file(&path, &settings)?;
+            // Official providers (e.g. "claude-official") only carry auth env vars.
+            // Doing a full replacement would wipe the user's permissions/mcpServers etc.
+            // Instead, merge only the env key into whatever the live file already has.
+            let final_settings =
+                if provider.category.as_deref() == Some("official")
+                    && is_env_only_claude_settings(&settings)
+                {
+                    merge_env_into_live_settings(&path, &settings)
+                } else {
+                    settings
+                };
+            write_json_file(&path, &final_settings)?;
         }
         AppType::ClaudeDesktop => {
             return Err(AppError::localized(
@@ -1623,5 +1664,99 @@ mod tests {
             .map(|value| value.as_str().expect("tool id should be string"))
             .collect();
         assert_eq!(values, vec!["tool2"]);
+    }
+
+    // ---- is_env_only_claude_settings ----
+
+    #[test]
+    fn is_env_only_empty_object() {
+        assert!(is_env_only_claude_settings(&json!({})));
+    }
+
+    #[test]
+    fn is_env_only_null_falls_back_to_true() {
+        assert!(is_env_only_claude_settings(&json!(null)));
+    }
+
+    #[test]
+    fn is_env_only_env_key_only() {
+        assert!(is_env_only_claude_settings(&json!({"env": {}})));
+        assert!(is_env_only_claude_settings(&json!({"env": {"MY_VAR": "1"}})));
+    }
+
+    #[test]
+    fn is_env_only_false_when_other_keys_present() {
+        assert!(!is_env_only_claude_settings(
+            &json!({"env": {}, "permissions": {}})
+        ));
+        assert!(!is_env_only_claude_settings(
+            &json!({"mcpServers": {}, "env": {}})
+        ));
+        assert!(!is_env_only_claude_settings(&json!({"permissions": {}})));
+    }
+
+    // ---- merge_env_into_live_settings ----
+
+    #[test]
+    fn merge_env_updates_only_env_key_leaves_rest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("settings.json");
+
+        // Write an existing live file with permissions and mcpServers
+        let existing = json!({
+            "permissions": {"allow": ["Bash"]},
+            "mcpServers": {"myserver": {}},
+            "env": {"OLD_VAR": "old"}
+        });
+        std::fs::write(&path, serde_json::to_string(&existing).unwrap()).unwrap();
+
+        let provider_settings = json!({"env": {"NEW_VAR": "new"}});
+        let result = merge_env_into_live_settings(&path, &provider_settings);
+
+        // env key replaced, everything else preserved
+        assert_eq!(result["env"], json!({"NEW_VAR": "new"}));
+        assert_eq!(result["permissions"], json!({"allow": ["Bash"]}));
+        assert_eq!(result["mcpServers"], json!({"myserver": {}}));
+    }
+
+    #[test]
+    fn merge_env_removes_env_key_when_provider_has_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("settings.json");
+
+        let existing = json!({"permissions": {}, "env": {"VAR": "1"}});
+        std::fs::write(&path, serde_json::to_string(&existing).unwrap()).unwrap();
+
+        // Provider has no env key (empty object with no env)
+        let provider_settings = json!({});
+        let result = merge_env_into_live_settings(&path, &provider_settings);
+
+        assert!(result.get("env").is_none(), "env should be removed");
+        assert!(result.get("permissions").is_some());
+    }
+
+    #[test]
+    fn merge_env_fallback_when_file_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("nonexistent_settings.json");
+
+        let provider_settings = json!({"env": {"KEY": "val"}});
+        let result = merge_env_into_live_settings(&path, &provider_settings);
+
+        // Falls back to provider settings as-is
+        assert_eq!(result, provider_settings);
+    }
+
+    #[test]
+    fn merge_env_into_empty_live_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("settings.json");
+
+        std::fs::write(&path, "{}").unwrap();
+
+        let provider_settings = json!({"env": {"API_KEY": "sk-123"}});
+        let result = merge_env_into_live_settings(&path, &provider_settings);
+
+        assert_eq!(result["env"], json!({"API_KEY": "sk-123"}));
     }
 }
