@@ -201,7 +201,30 @@ pub fn write_text_file(path: &Path, data: &str) -> Result<(), AppError> {
 }
 
 /// 原子写入：写入临时文件后 rename 替换，避免半写状态
+///
+/// 如果目标路径是符号链接，会解析到真实路径再进行写入，这样 rename 操作替换的是
+/// 真实文件而非符号链接本身，从而保留符号链接不变。
 pub fn atomic_write(path: &Path, data: &[u8]) -> Result<(), AppError> {
+    // Resolve symlinks so rename() replaces the real file, not the symlink entry.
+    // On POSIX, rename() operates on the directory entry — renaming over a symlink
+    // replaces the symlink itself with the new regular file.
+    let path = if path.is_symlink() {
+        match std::fs::read_link(path) {
+            Ok(target) => {
+                if target.is_absolute() {
+                    target
+                } else {
+                    path.parent()
+                        .unwrap_or(Path::new("."))
+                        .join(&target)
+                }
+            }
+            Err(_) => path.to_path_buf(),
+        }
+    } else {
+        path.to_path_buf()
+    };
+
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| AppError::io(parent, e))?;
     }
@@ -230,7 +253,7 @@ pub fn atomic_write(path: &Path, data: &[u8]) -> Result<(), AppError> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        if let Ok(meta) = fs::metadata(path) {
+        if let Ok(meta) = fs::metadata(&path) {
             let perm = meta.permissions().mode();
             let _ = fs::set_permissions(&tmp, fs::Permissions::from_mode(perm));
         }
@@ -240,9 +263,9 @@ pub fn atomic_write(path: &Path, data: &[u8]) -> Result<(), AppError> {
     {
         // Windows 上 rename 目标存在会失败，先移除再重命名（尽量接近原子性）
         if path.exists() {
-            let _ = fs::remove_file(path);
+            let _ = fs::remove_file(&path);
         }
-        fs::rename(&tmp, path).map_err(|e| AppError::IoContext {
+        fs::rename(&tmp, &path).map_err(|e| AppError::IoContext {
             context: format!("原子替换失败: {} -> {}", tmp.display(), path.display()),
             source: e,
         })?;
@@ -250,7 +273,7 @@ pub fn atomic_write(path: &Path, data: &[u8]) -> Result<(), AppError> {
 
     #[cfg(not(windows))]
     {
-        fs::rename(&tmp, path).map_err(|e| AppError::IoContext {
+        fs::rename(&tmp, &path).map_err(|e| AppError::IoContext {
             context: format!("原子替换失败: {} -> {}", tmp.display(), path.display()),
             source: e,
         })?;
