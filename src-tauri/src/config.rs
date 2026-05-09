@@ -200,30 +200,158 @@ pub fn write_text_file(path: &Path, data: &str) -> Result<(), AppError> {
     atomic_write(path, data.as_bytes())
 }
 
+/// Resolve `path` through any symlink layer(s) to the real underlying file.
+/// Returns `None` when `path` is already a regular file (no resolution needed)
+/// so callers can use `resolved.as_deref().unwrap_or(path)` cheaply.
+fn resolve_real_path(path: &Path) -> Option<PathBuf> {
+    // On Windows, check WSL paths FIRST. is_symlink() returns true for ANY reparse
+    // point (including IO_REPARSE_TAG_LX_SYMLINK) because FILE_ATTRIBUTE_REPARSE_POINT
+    // is set, but canonicalize() cannot follow LX symlinks — only `wsl readlink` can.
+    // Checking WSL paths first avoids canonicalize() swallowing the error path.
+    #[cfg(windows)]
+    {
+        if let Some(p) = resolve_wsl_symlink(path) {
+            return Some(p);
+        }
+    }
+
+    // Standard POSIX / Win32 symlinks — use canonicalize for recursive resolution.
+    if path.is_symlink() {
+        log::debug!("atomic_write: resolving symlink: {}", path.display());
+        let resolved = std::fs::canonicalize(path).ok();
+        match &resolved {
+            Some(r) => log::debug!("atomic_write: symlink resolved to: {}", r.display()),
+            None => log::warn!(
+                "atomic_write: canonicalize failed for symlink: {}",
+                path.display()
+            ),
+        }
+        return resolved;
+    }
+
+    None
+}
+
+/// Windows-only: resolve a WSL symlink on a `\\wsl.localhost\` or `\\wsl$\` path.
+///
+/// Runs two WSL commands: `readlink -f <path>` to canonicalize all symlink hops,
+/// then `wslpath -w <canonical>` to translate the result to a Windows path.
+/// Returns `None` if the path is not a WSL UNC path, is not a reparse point, or if
+/// resolution fails for any reason (caller falls back to the original path).
+#[cfg(windows)]
+fn resolve_wsl_symlink(path: &Path) -> Option<PathBuf> {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+
+    let path_str = path.to_string_lossy();
+    let lower = path_str.to_lowercase();
+
+    // Only process \\wsl.localhost\ and \\wsl$\ UNC paths.
+    let prefix_len = if lower.starts_with(r"\\wsl.localhost\") {
+        r"\\wsl.localhost\".len()
+    } else if lower.starts_with(r"\\wsl$\") {
+        r"\\wsl$\".len()
+    } else {
+        return None;
+    };
+
+    // Bail out quickly for non-reparse-point entries (regular files inside WSL don't need resolution).
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0 {
+        log::debug!(
+            "atomic_write: WSL path is a regular file, no symlink resolution needed: {}",
+            path.display()
+        );
+        return None;
+    }
+
+    log::debug!(
+        "atomic_write: WSL path has ReparsePoint attribute (LX symlink): {}",
+        path.display()
+    );
+
+    // Parse: \\wsl.localhost\<distro>\<rest...>
+    let after_server = &path_str[prefix_len..];
+    let slash_pos = after_server.find('\\')?;
+    let distro = &after_server[..slash_pos];
+    // Convert Windows-style separators to forward slashes for the WSL path.
+    let wsl_path = after_server[slash_pos..].replace('\\', "/");
+    // wsl_path is now like /home/wangbin/.claude/settings.json
+
+    log::debug!("atomic_write: WSL distro={distro}, wsl_path={wsl_path}");
+
+    // Step 1: resolve all symlink hops to get the canonical WSL path.
+    let readlink_out = std::process::Command::new("wsl")
+        .args(["-d", distro, "--", "readlink", "-f", &wsl_path])
+        .output()
+        .ok()?;
+
+    if !readlink_out.status.success() {
+        log::warn!(
+            "atomic_write: `wsl -d {distro} readlink -f {wsl_path}` failed (exit {}): {}",
+            readlink_out.status,
+            String::from_utf8_lossy(&readlink_out.stderr).trim()
+        );
+        return None;
+    }
+
+    let canonical_wsl = String::from_utf8(readlink_out.stdout).ok()?;
+    let canonical_wsl = canonical_wsl.trim();
+    if canonical_wsl.is_empty() {
+        log::warn!("atomic_write: readlink -f returned empty output for {wsl_path} in {distro}");
+        return None;
+    }
+
+    log::debug!("atomic_write: canonical WSL path: {canonical_wsl}");
+
+    // Step 2: translate the canonical WSL path to a Windows path.
+    // wslpath -w converts /mnt/X/... -> X:\... and returns a \\wsl$\... UNC path for WSL-only paths.
+    let wslpath_out = std::process::Command::new("wsl")
+        .args(["-d", distro, "--", "wslpath", "-w", canonical_wsl])
+        .output()
+        .ok()?;
+
+    if !wslpath_out.status.success() {
+        log::warn!(
+            "atomic_write: `wsl -d {distro} wslpath -w {canonical_wsl}` failed (exit {}): {}",
+            wslpath_out.status,
+            String::from_utf8_lossy(&wslpath_out.stderr).trim()
+        );
+        return None;
+    }
+
+    let win_path = String::from_utf8(wslpath_out.stdout).ok()?;
+    let win_path = win_path.trim();
+    if win_path.is_empty() {
+        log::warn!(
+            "atomic_write: wslpath -w returned empty for canonical path {canonical_wsl} in {distro}"
+        );
+        return None;
+    }
+
+    log::debug!("atomic_write: resolved WSL symlink -> Windows path: {win_path}");
+
+    Some(PathBuf::from(win_path))
+}
+
 /// 原子写入：写入临时文件后 rename 替换，避免半写状态
 ///
 /// 如果目标路径是符号链接，会解析到真实路径再进行写入，这样 rename 操作替换的是
 /// 真实文件而非符号链接本身，从而保留符号链接不变。
+///
+/// 在 Windows 上额外处理 WSL 符号链接（IO_REPARSE_TAG_LX_SYMLINK），这类链接的
+/// reparse tag 不被 Rust 标准库的 is_symlink() 识别，需要通过 wsl 命令解析。
 pub fn atomic_write(path: &Path, data: &[u8]) -> Result<(), AppError> {
     // Resolve symlinks so rename() replaces the real file, not the symlink entry.
     // On POSIX, rename() operates on the directory entry — renaming over a symlink
     // replaces the symlink itself with the new regular file.
-    let path = if path.is_symlink() {
-        match std::fs::read_link(path) {
-            Ok(target) => {
-                if target.is_absolute() {
-                    target
-                } else {
-                    path.parent()
-                        .unwrap_or(Path::new("."))
-                        .join(&target)
-                }
-            }
-            Err(_) => path.to_path_buf(),
-        }
-    } else {
-        path.to_path_buf()
-    };
+    //
+    // On Windows we also handle WSL symlinks (IO_REPARSE_TAG_LX_SYMLINK): these show
+    // as ReparsePoint in file attributes but is_symlink() returns false because the tag
+    // is unknown to the Win32 symlink API. We detect them via the ReparsePoint attribute
+    // on \\wsl.localhost\ paths and resolve via `wsl readlink -f | wslpath -w`.
+    let resolved = resolve_real_path(path);
+    let path: &Path = resolved.as_deref().unwrap_or(path);
 
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| AppError::io(parent, e))?;
@@ -410,6 +538,162 @@ mod tests {
             serde_json::to_string(&sorted_a).unwrap(),
             serde_json::to_string(&sorted_b).unwrap(),
         );
+    }
+
+    // ── atomic_write tests ────────────────────────────────────────────────────
+
+    #[test]
+    fn atomic_write_creates_and_updates_regular_file() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let path = dir.path().join("test.json");
+
+        atomic_write(&path, b"first").expect("first write");
+        assert_eq!(std::fs::read(&path).unwrap(), b"first");
+
+        atomic_write(&path, b"second").expect("second write");
+        assert_eq!(std::fs::read(&path).unwrap(), b"second");
+    }
+
+    /// Unix-only: verify that atomic_write writes through a POSIX symlink without
+    /// replacing the symlink entry itself.
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_preserves_posix_symlink() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let real = dir.path().join("real.json");
+        let link = dir.path().join("link.json");
+
+        std::fs::write(&real, b"original").expect("write real");
+        std::os::unix::fs::symlink(&real, &link).expect("create symlink");
+
+        atomic_write(&link, b"updated").expect("atomic_write through symlink");
+
+        // The link entry must still be a symlink.
+        assert!(
+            link.symlink_metadata().unwrap().file_type().is_symlink(),
+            "symlink was replaced by a regular file"
+        );
+        // The real file must contain the new content.
+        assert_eq!(std::fs::read(&real).unwrap(), b"updated");
+    }
+
+    /// Windows-only: resolve_wsl_symlink must return None immediately for any
+    /// path that is not a \\wsl.localhost\ or \\wsl$\ UNC path, without doing
+    /// any IO or spawning WSL.
+    #[cfg(windows)]
+    #[test]
+    fn resolve_wsl_symlink_ignores_non_wsl_paths() {
+        for p in [
+            r"C:\Users\foo\settings.json",
+            r"D:\projects\bar.json",
+            r"\\server\share\file.txt",
+        ] {
+            assert!(
+                resolve_wsl_symlink(Path::new(p)).is_none(),
+                "expected None for non-WSL path: {p}"
+            );
+        }
+    }
+
+    /// Windows + WSL integration test: atomic_write must write the new content
+    /// to the real file and leave the WSL symlink entry intact.
+    ///
+    /// Skipped automatically when the default WSL distro is not running.
+    #[cfg(windows)]
+    #[test]
+    fn atomic_write_preserves_wsl_symlink() {
+        // Discover the default running WSL distro name.
+        let distro = match wsl_default_distro() {
+            Some(d) => d,
+            None => {
+                eprintln!("SKIP atomic_write_preserves_wsl_symlink: no WSL distro running");
+                return;
+            }
+        };
+
+        // 1. Create a real temp file on the Windows filesystem.
+        let win_dir = tempfile::TempDir::new().expect("tempdir");
+        let real_win = win_dir.path().join("settings.json");
+        std::fs::write(&real_win, b"{}").expect("write real file");
+
+        // 2. Translate the Windows path to a WSL /mnt/<drive>/... path.
+        // We do this manually rather than spawning `wslpath -u` because wslpath
+        // has trouble with backslash-separated paths when invoked via Command::new.
+        let wsl_real = win_path_to_wsl(&real_win)
+            .expect("could not convert temp dir path to WSL /mnt/ form");
+
+        // 3. Create a WSL symlink in /tmp pointing at the real file.
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let wsl_link = format!("/tmp/cc_switch_test_{ts}.json");
+        let ln_out = std::process::Command::new("wsl")
+            .args(["-d", &distro, "--", "ln", "-sf", &wsl_real, &wsl_link])
+            .output()
+            .expect("ln -sf");
+        assert!(ln_out.status.success(), "failed to create WSL test symlink");
+
+        // 4. Build the Windows UNC path for the symlink.
+        let wsl_link_win = wsl_link.replace('/', "\\").trim_start_matches('\\').to_owned();
+        let unc = format!(r"\\wsl.localhost\{distro}\{wsl_link_win}");
+
+        // 5. Write through the symlink.
+        let new_content = br#"{"model":"claude-sonnet-4-7"}"#;
+        let result = atomic_write(Path::new(&unc), new_content);
+
+        // Always clean up the WSL symlink before asserting.
+        let _ = std::process::Command::new("wsl")
+            .args(["-d", &distro, "--", "rm", "-f", &wsl_link])
+            .output();
+
+        result.expect("atomic_write through WSL symlink should succeed");
+
+        // 6. The real file must contain the new content.
+        let written = std::fs::read(&real_win).expect("read real file after write");
+        assert_eq!(
+            written, new_content,
+            "content was not written to the real file behind the WSL symlink"
+        );
+
+        // Symlink preservation is implied by step 6: if atomic_write had destroyed
+        // the symlink and written to a new file at the UNC path instead, real_win
+        // would still contain the original "{}" and the content assertion would fail.
+    }
+
+    /// Converts a Windows absolute path to the WSL `/mnt/<drive>/...` form.
+    /// e.g. `C:\Users\foo\bar.json` → `/mnt/c/Users/foo/bar.json`
+    #[cfg(windows)]
+    fn win_path_to_wsl(path: &Path) -> Option<String> {
+        let s = path.to_string_lossy();
+        let mut chars = s.chars();
+        let drive = chars.next()?.to_lowercase().next()?;
+        if chars.next()? != ':' {
+            return None;
+        }
+        let rest = chars.as_str().replace('\\', "/");
+        Some(format!("/mnt/{drive}{rest}"))
+    }
+
+    /// Returns the name of the default running WSL distro, or None if WSL is
+    /// unavailable or no distro is running.  Uses `$WSL_DISTRO_NAME` to avoid
+    /// parsing UTF-16 output from `wsl -l`.
+    #[cfg(windows)]
+    fn wsl_default_distro() -> Option<String> {
+        let out = std::process::Command::new("wsl")
+            .args(["--", "bash", "-c", "echo $WSL_DISTRO_NAME"])
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let name = String::from_utf8(out.stdout).ok()?;
+        let name = name.trim().to_owned();
+        if name.is_empty() {
+            None
+        } else {
+            Some(name)
+        }
     }
 }
 

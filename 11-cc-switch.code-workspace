@@ -2,9 +2,6 @@
 	"folders": [
 		{
 			"path": "."
-		},
-		{
-			"path": "../01-VibeCoding-Utility"
 		}
 	],
 	"settings": {}
